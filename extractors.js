@@ -3,7 +3,7 @@
 // Bridge provided by the app: http({url, method, headers, body}) -> Promise<{status, headers, text, url}>
 // Each extractor returns {title, thumb, duration, uploader, formats:[...]}
 // format: {id, kind:'muxed'|'video'|'audio', label, detail, ext, size, height, url, headers}
-var FLOW_VERSION = 11;
+var FLOW_VERSION = 12;
 // FLOW_MIN_NATIVE (optional): lowest app native level this file needs. Older apps skip the file.
 function flowSelfTest() { return typeof http === "function" && typeof flowExtract === "function"; }
 var UA_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1';
@@ -336,9 +336,14 @@ function igCode(u) { var m = u.match(/instagram\.com\/(?:[A-Za-z0-9_.]+\/)?(?:p|
 async function instagram(url) {
   var code = igCode(url);
   if (!code) throw new Error('Instagram: paste a link to a post or reel');
-  var r = await http({ url: 'https://www.instagram.com/p/' + code + '/embed/captioned/', headers: { 'User-Agent': UA_IOS, 'Accept-Language': 'en-US,en;q=0.9' } });
-  var html = r.text || '';
-  var vu = null;
+  var html = '', vu = null, eu = ['https://www.instagram.com/p/' + code + '/embed/captioned/', 'https://www.instagram.com/reel/' + code + '/embed/captioned/', 'https://www.instagram.com/p/' + code + '/embed/'];
+  for (var q = 0; q < eu.length && !vu; q++) {
+    try { var r = await http({ url: eu[q], headers: { 'User-Agent': UA_IOS, 'Accept-Language': 'en-US,en;q=0.9' } }); html = r.text || ''; } catch (e) { continue; }
+    var flat = html.replace(/\\+\//g, '/').replace(/\\+"/g, '"').replace(/\\u0026/g, '&');
+    var g = flat.match(/"video_url"\s*:\s*"(https:[^"]+)"/) || flat.match(/"video_versions"\s*:\s*\[\s*\{[^\]]*?"url"\s*:\s*"(https:[^"]+)"/);
+    if (g) { vu = g[1]; break; }
+    if (q < eu.length - 1 && !/video/.test(flat)) continue;
+  }
   var m = html.match(/"video_url"\s*:\s*"([^"]+)"/);
   if (m) vu = fixEsc(m[1]);
   if (!vu) { m = html.match(/<video[^>]+src="([^"]+)"/); if (m) vu = fixEsc(m[1]); }
