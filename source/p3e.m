@@ -70,6 +70,17 @@ static NSString *NameFromDisposition(NSString *cd) {
     return nil;
 }
 
+static NSString *ThumbPath(NSString *p);
+static void FetchCover(NSString *url, void (^cb)(NSData *)) {
+    NSURL *u = url.length ? [NSURL URLWithString:url] : nil; if (!u) { cb(nil); return; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 10;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        UIImage *i = d.length ? [UIImage imageWithData:d] : nil;
+        NSData *j = i ? UIImageJPEGRepresentation(i, 0.85) : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ cb(j); });
+    }] resume];
+}
+static void SaveCoverSidecar(NSString *path, NSData *jpg) { if (jpg.length && path.length) [jpg writeToFile:ThumbPath(path) atomically:YES]; }
 @implementation Mgr
 + (Mgr *)shared { static Mgr *m; static dispatch_once_t o; dispatch_once(&o, ^{ m = [Mgr new]; [m setup]; }); return m; }
 - (int)conns { NSInteger c = [UD() integerForKey:@"conns"]; return c < 2 ? 6 : (c > 8 ? 8 : (int)c); }
@@ -357,21 +368,25 @@ static BOOL IsGV(NSString *u) { return [[NSURL URLWithString:u ?: @""].host hasS
     j.date = [NSDate date];
     if (!j.hidden) [self persist];
     [self notify]; if (!j.hidden) [self endBackgroundIfIdle];
+    if (!j.hidden && j.thumbURL.length && j.path.length && KindOf(j.path) == 3) { NSString *pp = j.path; FetchCover(j.thumbURL, ^(NSData *d) { SaveCoverSidecar(pp, d); if (d) [self notify]; }); }
 }
 - (void)extractAudioFor:(Job *)j {
     [self closeFile:j]; j.state = 5; j.speed = 0; [self notify];
+    FetchCover(j.thumbURL, ^(NSData *cover) {
     NSString *src = j.path; NSString *dst = UniquePath(src.stringByDeletingLastPathComponent, [src.lastPathComponent.stringByDeletingPathExtension stringByAppendingPathExtension:@"m4a"]);
     AVURLAsset *as = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:src] options:nil];
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:as presetName:AVAssetExportPresetAppleM4A];
     if (!ex) { j.state = 2; j.note = L(@"Could not extract audio, saved as video", @"معرفتش أطلّع الصوت، اتحفظ فيديو"); [self persist]; [self notify]; [self endBackgroundIfIdle]; return; }
     ex.outputURL = [NSURL fileURLWithPath:dst]; ex.outputFileType = AVFileTypeAppleM4A;
+    if (cover.length) { AVMutableMetadataItem *mi = [AVMutableMetadataItem new]; mi.identifier = AVMetadataIdentifieriTunesMetadataCoverArt; mi.dataType = (NSString *)kCMMetadataBaseDataType_JPEG; mi.value = cover; ex.metadata = @[ mi ]; }
     [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_async(dispatch_get_main_queue(), ^{
         if (ex.status == AVAssetExportSessionStatusCompleted) {
             [NSFileManager.defaultManager removeItemAtPath:src error:nil];
-            j.path = dst; j.name = dst.lastPathComponent; j.total = j.got = SizeOf(dst);
+            j.path = dst; j.name = dst.lastPathComponent; j.total = j.got = SizeOf(dst); SaveCoverSidecar(dst, cover);
         } else { [NSFileManager.defaultManager removeItemAtPath:dst error:nil]; j.note = L(@"Could not extract audio, saved as video", @"معرفتش أطلّع الصوت، اتحفظ فيديو"); j.total = j.got = SizeOf(src); }
         j.state = 2; j.date = [NSDate date]; [self persist]; [self notify]; [self endBackgroundIfIdle];
     }); }];
+    });
 }
 - (void)cancel:(Job *)j {
     if (j.state >= 2 && j.state != 5) return;

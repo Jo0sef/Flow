@@ -11,8 +11,26 @@ static UIImage *Sym(NSString *name, CGFloat size, UIFontWeight w) {
     UIImageSymbolConfiguration *c = [UIImageSymbolConfiguration configurationWithPointSize:size weight:w];
     return [UIImage systemImageNamed:name withConfiguration:c] ?: [UIImage systemImageNamed:@"doc" withConfiguration:c];
 }
+@interface FlowTable : UITableView
+@end
+@implementation FlowTable
+@end
+static void AddPull(UITableView *t, id target) {
+    UIRefreshControl *rc = [UIRefreshControl new]; rc.tintColor = UIColor.whiteColor;
+    [rc addTarget:target action:NSSelectorFromString(@"pullRefresh") forControlEvents:UIControlEventValueChanged];
+    t.refreshControl = rc;
+}
+// Closes the spinner reliably: waits for the finger to lift (ending while dragging leaves the list stuck), but never longer than ~4 s.
+static void EndPull(UITableView *t) {
+    __block int tries = 0; __block void (^step)(void);
+    step = ^{
+        if ((t.isDragging || t.isTracking) && tries++ < 12) { dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), step); return; }
+        [t.refreshControl endRefreshing]; step = nil;
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+}
 static UITableView *MakeTable(id owner) {
-    UITableView *t = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    UITableView *t = [[FlowTable alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     t.translatesAutoresizingMaskIntoConstraints = NO; t.backgroundColor = UIColor.clearColor; t.separatorStyle = UITableViewCellSeparatorStyleNone;
     t.dataSource = owner; t.delegate = owner; t.contentInset = UIEdgeInsetsMake(0, 0, 110, 0); t.verticalScrollIndicatorInsets = UIEdgeInsetsMake(0, 0, 70, 0);
     t.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic; t.showsVerticalScrollIndicator = NO;

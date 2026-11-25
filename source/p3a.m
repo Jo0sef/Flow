@@ -2,9 +2,23 @@
 #pragma mark - Storage helpers
 
 static NSString *Docs(void) { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject; }
+// Orientation the app currently allows. Portrait everywhere except while the video player is in landscape mode.
+static UIInterfaceOrientationMask gOrient = UIInterfaceOrientationMaskPortrait;
+// Drops characters that draw as empty boxes (replacement characters, control and invisible format characters except direction marks).
+static NSString *CleanTitle(NSString *s) {
+    NSMutableString *m = [NSMutableString string];
+    [s enumerateSubstringsInRange:NSMakeRange(0, s.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *sub, NSRange r, NSRange e, BOOL *stop) {
+        unichar c = [sub characterAtIndex:0];
+        if (c == 0xFFFD || c == 0xFFFC || (c < 0x20) || c == 0x7F || (c >= 0x80 && c < 0xA0)) return;
+        if (c == 0x200B || c == 0xFEFF || c == 0x2060 || (c >= 0x202A && c <= 0x202E) || (c >= 0x2066 && c <= 0x2069)) return;
+        [m appendString:sub];
+    }];
+    NSString *r = [m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return r.length ? r : s;
+}
 static NSString *FmtSize(int64_t b) { return [NSByteCountFormatter stringFromByteCount:b countStyle:NSByteCountFormatterCountStyleFile]; }
 static NSString *SafeName(NSString *s) {
-    NSMutableString *m = [NSMutableString stringWithString:s ?: @""];
+    NSMutableString *m = [NSMutableString stringWithString:CleanTitle(s ?: @"")];
     for (NSString *bad in @[ @"/", @"\\", @":", @"?", @"*", @"\"", @"<", @">", @"|", @"\n", @"\r" ]) [m replaceOccurrencesOfString:bad withString:@"_" options:0 range:NSMakeRange(0, m.length)];
     NSString *r = [m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     while ([r hasPrefix:@"."]) r = [r substringFromIndex:1];

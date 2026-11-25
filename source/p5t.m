@@ -66,6 +66,7 @@ static void TrashAutoPurge(void) {
     [super viewDidLoad]; self.title = L(@"Trash", @"سلة المحذوفات");
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     self.table = MakeTable(self); [self.view addSubview:self.table];
+    AddPull(self.table, self);
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[ [self.table.topAnchor constraintEqualToAnchor:g.topAnchor], [self.table.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor], [self.table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [self.table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor] ]];
     self.empty = EmptyState(@"trash", L(@"Trash is empty", @"السلة فاضية"), L(@"Deleted files stay here until you remove them.", @"الملفات اللي بتحذفها بتفضل هنا لحد ما تمسحها."));
@@ -135,4 +136,5 @@ static void TrashAutoPurge(void) {
     r.backgroundColor = [UIColor systemGreenColor];
     return [UISwipeActionsConfiguration configurationWithActions:@[ r ]];
 }
+- (void)pullRefresh { TrashAutoPurge(); [self reload]; EndPull(self.table); }
 @end

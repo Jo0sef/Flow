@@ -7,6 +7,7 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
+#import <MediaPlayer/MediaPlayer.h>
 #import <Photos/Photos.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 #import <LocalAuthentication/LocalAuthentication.h>
@@ -14,6 +15,7 @@
 #import <Vision/Vision.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <Foundation/Foundation.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -405,9 +407,23 @@ static UIView *EmptyState(NSString *symbol, NSString *title, NSString *sub) {
 #pragma mark - Storage helpers
 
 static NSString *Docs(void) { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject; }
+// Orientation the app currently allows. Portrait everywhere except while the video player is in landscape mode.
+static UIInterfaceOrientationMask gOrient = UIInterfaceOrientationMaskPortrait;
+// Drops characters that draw as empty boxes (replacement characters, control and invisible format characters except direction marks).
+static NSString *CleanTitle(NSString *s) {
+    NSMutableString *m = [NSMutableString string];
+    [s enumerateSubstringsInRange:NSMakeRange(0, s.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *sub, NSRange r, NSRange e, BOOL *stop) {
+        unichar c = [sub characterAtIndex:0];
+        if (c == 0xFFFD || c == 0xFFFC || (c < 0x20) || c == 0x7F || (c >= 0x80 && c < 0xA0)) return;
+        if (c == 0x200B || c == 0xFEFF || c == 0x2060 || (c >= 0x202A && c <= 0x202E) || (c >= 0x2066 && c <= 0x2069)) return;
+        [m appendString:sub];
+    }];
+    NSString *r = [m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return r.length ? r : s;
+}
 static NSString *FmtSize(int64_t b) { return [NSByteCountFormatter stringFromByteCount:b countStyle:NSByteCountFormatterCountStyleFile]; }
 static NSString *SafeName(NSString *s) {
-    NSMutableString *m = [NSMutableString stringWithString:s ?: @""];
+    NSMutableString *m = [NSMutableString stringWithString:CleanTitle(s ?: @"")];
     for (NSString *bad in @[ @"/", @"\\", @":", @"?", @"*", @"\"", @"<", @">", @"|", @"\n", @"\r" ]) [m replaceOccurrencesOfString:bad withString:@"_" options:0 range:NSMakeRange(0, m.length)];
     NSString *r = [m stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     while ([r hasPrefix:@"."]) r = [r substringFromIndex:1];
@@ -645,6 +661,17 @@ static NSString *NameFromDisposition(NSString *cd) {
     return nil;
 }
 
+static NSString *ThumbPath(NSString *p);
+static void FetchCover(NSString *url, void (^cb)(NSData *)) {
+    NSURL *u = url.length ? [NSURL URLWithString:url] : nil; if (!u) { cb(nil); return; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 10;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        UIImage *i = d.length ? [UIImage imageWithData:d] : nil;
+        NSData *j = i ? UIImageJPEGRepresentation(i, 0.85) : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ cb(j); });
+    }] resume];
+}
+static void SaveCoverSidecar(NSString *path, NSData *jpg) { if (jpg.length && path.length) [jpg writeToFile:ThumbPath(path) atomically:YES]; }
 @implementation Mgr
 + (Mgr *)shared { static Mgr *m; static dispatch_once_t o; dispatch_once(&o, ^{ m = [Mgr new]; [m setup]; }); return m; }
 - (int)conns { NSInteger c = [UD() integerForKey:@"conns"]; return c < 2 ? 6 : (c > 8 ? 8 : (int)c); }
@@ -932,21 +959,25 @@ static BOOL IsGV(NSString *u) { return [[NSURL URLWithString:u ?: @""].host hasS
     j.date = [NSDate date];
     if (!j.hidden) [self persist];
     [self notify]; if (!j.hidden) [self endBackgroundIfIdle];
+    if (!j.hidden && j.thumbURL.length && j.path.length && KindOf(j.path) == 3) { NSString *pp = j.path; FetchCover(j.thumbURL, ^(NSData *d) { SaveCoverSidecar(pp, d); if (d) [self notify]; }); }
 }
 - (void)extractAudioFor:(Job *)j {
     [self closeFile:j]; j.state = 5; j.speed = 0; [self notify];
+    FetchCover(j.thumbURL, ^(NSData *cover) {
     NSString *src = j.path; NSString *dst = UniquePath(src.stringByDeletingLastPathComponent, [src.lastPathComponent.stringByDeletingPathExtension stringByAppendingPathExtension:@"m4a"]);
     AVURLAsset *as = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:src] options:nil];
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:as presetName:AVAssetExportPresetAppleM4A];
     if (!ex) { j.state = 2; j.note = L(@"Could not extract audio, saved as video", @"معرفتش أطلّع الصوت، اتحفظ فيديو"); [self persist]; [self notify]; [self endBackgroundIfIdle]; return; }
     ex.outputURL = [NSURL fileURLWithPath:dst]; ex.outputFileType = AVFileTypeAppleM4A;
+    if (cover.length) { AVMutableMetadataItem *mi = [AVMutableMetadataItem new]; mi.identifier = AVMetadataIdentifieriTunesMetadataCoverArt; mi.dataType = (NSString *)kCMMetadataBaseDataType_JPEG; mi.value = cover; ex.metadata = @[ mi ]; }
     [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_async(dispatch_get_main_queue(), ^{
         if (ex.status == AVAssetExportSessionStatusCompleted) {
             [NSFileManager.defaultManager removeItemAtPath:src error:nil];
-            j.path = dst; j.name = dst.lastPathComponent; j.total = j.got = SizeOf(dst);
+            j.path = dst; j.name = dst.lastPathComponent; j.total = j.got = SizeOf(dst); SaveCoverSidecar(dst, cover);
         } else { [NSFileManager.defaultManager removeItemAtPath:dst error:nil]; j.note = L(@"Could not extract audio, saved as video", @"معرفتش أطلّع الصوت، اتحفظ فيديو"); j.total = j.got = SizeOf(src); }
         j.state = 2; j.date = [NSDate date]; [self persist]; [self notify]; [self endBackgroundIfIdle];
     }); }];
+    });
 }
 - (void)cancel:(Job *)j {
     if (j.state >= 2 && j.state != 5) return;
@@ -1333,8 +1364,26 @@ static UIImage *Sym(NSString *name, CGFloat size, UIFontWeight w) {
     UIImageSymbolConfiguration *c = [UIImageSymbolConfiguration configurationWithPointSize:size weight:w];
     return [UIImage systemImageNamed:name withConfiguration:c] ?: [UIImage systemImageNamed:@"doc" withConfiguration:c];
 }
+@interface FlowTable : UITableView
+@end
+@implementation FlowTable
+@end
+static void AddPull(UITableView *t, id target) {
+    UIRefreshControl *rc = [UIRefreshControl new]; rc.tintColor = UIColor.whiteColor;
+    [rc addTarget:target action:NSSelectorFromString(@"pullRefresh") forControlEvents:UIControlEventValueChanged];
+    t.refreshControl = rc;
+}
+// Closes the spinner reliably: waits for the finger to lift (ending while dragging leaves the list stuck), but never longer than ~4 s.
+static void EndPull(UITableView *t) {
+    __block int tries = 0; __block void (^step)(void);
+    step = ^{
+        if ((t.isDragging || t.isTracking) && tries++ < 12) { dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), step); return; }
+        [t.refreshControl endRefreshing]; step = nil;
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+}
 static UITableView *MakeTable(id owner) {
-    UITableView *t = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    UITableView *t = [[FlowTable alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     t.translatesAutoresizingMaskIntoConstraints = NO; t.backgroundColor = UIColor.clearColor; t.separatorStyle = UITableViewCellSeparatorStyleNone;
     t.dataSource = owner; t.delegate = owner; t.contentInset = UIEdgeInsetsMake(0, 0, 110, 0); t.verticalScrollIndicatorInsets = UIEdgeInsetsMake(0, 0, 70, 0);
     t.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic; t.showsVerticalScrollIndicator = NO;
@@ -2069,6 +2118,7 @@ static void StartLinkEx(UIViewController *vc, NSString *s, void (^direct)(void),
     [super viewDidLoad];
     self.title = @"Downloads"; self.sel = [NSMutableSet set];
     self.table = MakeTable(self); [self.view addSubview:self.table];
+    AddPull(self.table, self);
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[ [self.table.topAnchor constraintEqualToAnchor:g.topAnchor], [self.table.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [self.table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [self.table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor] ]];
@@ -2173,6 +2223,7 @@ static void StartLinkEx(UIViewController *vc, NSString *s, void (^direct)(void),
         [[Mgr shared] remove:j deleteFile:YES]; h(YES); }];
     return [UISwipeActionsConfiguration configurationWithActions:@[ d ]];
 }
+- (void)pullRefresh { [self.table reloadData]; [self reload]; EndPull(self.table); }
 @end
 #pragma mark - Trash (recycle bin)
 
@@ -2242,6 +2293,7 @@ static void TrashAutoPurge(void) {
     [super viewDidLoad]; self.title = L(@"Trash", @"سلة المحذوفات");
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     self.table = MakeTable(self); [self.view addSubview:self.table];
+    AddPull(self.table, self);
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[ [self.table.topAnchor constraintEqualToAnchor:g.topAnchor], [self.table.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor], [self.table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [self.table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor] ]];
     self.empty = EmptyState(@"trash", L(@"Trash is empty", @"السلة فاضية"), L(@"Deleted files stay here until you remove them.", @"الملفات اللي بتحذفها بتفضل هنا لحد ما تمسحها."));
@@ -2311,6 +2363,7 @@ static void TrashAutoPurge(void) {
     r.backgroundColor = [UIColor systemGreenColor];
     return [UISwipeActionsConfiguration configurationWithActions:@[ r ]];
 }
+- (void)pullRefresh { TrashAutoPurge(); [self reload]; EndPull(self.table); }
 @end
 #pragma mark - Thumbnails, player, pins
 
@@ -2325,13 +2378,28 @@ static NSString *ThumbPath(NSString *p) {
 }
 static void ThumbFor(NSString *path, void (^cb)(UIImage *)) {
     if (!gThumbs) gThumbs = [NSCache new];
-    NSString *key = [path stringByAppendingFormat:@"|%.0f", [[[NSFileManager.defaultManager attributesOfItemAtPath:ThumbPath(path) error:nil] fileModificationDate] timeIntervalSince1970]];
+    NSString *key = [path stringByAppendingFormat:@"|%.0f|%.0f", [[[NSFileManager.defaultManager attributesOfItemAtPath:ThumbPath(path) error:nil] fileModificationDate] timeIntervalSince1970], [[[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileModificationDate] timeIntervalSince1970]];
     UIImage *c = [gThumbs objectForKey:key]; if (c) { cb(c); return; }
     int k = KindOf(path);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         UIImage *img = nil;
         NSString *custom = ThumbPath(path);
         if ([NSFileManager.defaultManager fileExistsAtPath:custom]) img = [UIImage imageWithContentsOfFile:custom];
+        else if (k == 3) {
+            AVURLAsset *as = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [as loadValuesAsynchronouslyForKeys:@[ @"commonMetadata", @"metadata" ] completionHandler:^{ dispatch_semaphore_signal(sem); }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+            AVMetadataItem *mi = [AVMetadataItem metadataItemsFromArray:as.commonMetadata filteredByIdentifier:AVMetadataCommonIdentifierArtwork].firstObject;
+            if (!mi) mi = [AVMetadataItem metadataItemsFromArray:as.metadata filteredByIdentifier:AVMetadataIdentifieriTunesMetadataCoverArt].firstObject;
+            if (!mi) mi = [AVMetadataItem metadataItemsFromArray:as.metadata filteredByIdentifier:AVMetadataIdentifierID3MetadataAttachedPicture].firstObject;
+            NSData *d = mi.dataValue;
+            if (d.length) {
+                NSDictionary *o = @{ (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES, (id)kCGImageSourceThumbnailMaxPixelSize: @200, (id)kCGImageSourceCreateThumbnailWithTransform: @YES };
+                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)d, NULL);
+                if (src) { CGImageRef cg = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)o); if (cg) { img = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); } CFRelease(src); }
+            }
+        }
         else if (k == 1) {
             NSDictionary *o = @{ (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES, (id)kCGImageSourceThumbnailMaxPixelSize: @200, (id)kCGImageSourceCreateThumbnailWithTransform: @YES };
             CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
@@ -2349,6 +2417,23 @@ static NSMutableArray *Pins(void) { return [([UD() arrayForKey:@"pins"] ?: @[]) 
 static BOOL IsPinned(NSString *p) { return [Pins() containsObject:RelPath(p)]; }
 static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = RelPath(p); if ([a containsObject:r]) [a removeObject:r]; else [a addObject:r]; [UD() setObject:a forKey:@"pins"]; }
 
+static void ForceOrientation(UIViewController *vc, UIInterfaceOrientationMask mask, UIInterfaceOrientation fallback) {
+    UIWindowScene *sc = vc.view.window.windowScene;
+    if (!sc) for (UIScene *x in UIApplication.sharedApplication.connectedScenes) if ([x isKindOfClass:UIWindowScene.class]) { sc = (UIWindowScene *)x; break; }
+    Class pc = NSClassFromString(@"UIWindowSceneGeometryPreferencesIOS");
+    SEL rq = NSSelectorFromString(@"requestGeometryUpdateWithPreferences:errorHandler:");
+    if (pc && sc && [sc respondsToSelector:rq]) {   // iOS 16 and later
+        typedef id (*InitFn)(id, SEL, UIInterfaceOrientationMask);
+        id obj = ((InitFn)objc_msgSend)([pc alloc], NSSelectorFromString(@"initWithInterfaceOrientations:"), mask);
+        typedef void (*ReqFn)(id, SEL, id, void (^)(NSError *));
+        ((ReqFn)objc_msgSend)(sc, rq, obj, ^(NSError *e) { });
+        SEL up = NSSelectorFromString(@"setNeedsUpdateOfSupportedInterfaceOrientations");
+        if ([vc respondsToSelector:up]) ((void (*)(id, SEL))objc_msgSend)(vc, up);
+    } else {
+        [UIDevice.currentDevice setValue:@(fallback) forKey:@"orientation"];
+        [UIViewController attemptRotationToDeviceOrientation];
+    }
+}
 @interface PlayerVC : UIViewController <UIGestureRecognizerDelegate>
 @property(nonatomic, copy) NSString *path;
 @property(nonatomic, strong) AVPlayer *player;
@@ -2357,15 +2442,45 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
 @property(nonatomic, strong) GlassView *top, *bot;
 @property(nonatomic, strong) UISlider *slider;
 @property(nonatomic, strong) UILabel *tcur, *tend;
-@property(nonatomic, strong) UIButton *playBtn, *spdBtn, *loopBtn;
+@property(nonatomic, strong) UIButton *playBtn, *spdBtn, *loopBtn, *rotBtn;
+@property(nonatomic) BOOL landscape, minimized, started;
+@property(nonatomic, strong) NSMutableArray *remoteTokens;
 @property(nonatomic, strong) UIImageView *art;
 @property(nonatomic, strong) id timeObs;
 @property(nonatomic, strong) NSTimer *hideTimer;
 @property(nonatomic) BOOL scrubbing, audio, loop, failedShown, closing;
 @property(nonatomic) float speed;
+- (void)fullStop;
+- (void)togglePlay;
 @end
+@class PlayerVC;
+static PlayerVC *gActivePlayer;   // the player that keeps going (full screen or minimized to the mini bar)
+static void MiniShow(PlayerVC *p);
+static void MiniHide(void);
+static void MiniRefresh(void);
+
 @implementation PlayerVC
-- (BOOL)prefersStatusBarHidden { return NO; }
+- (BOOL)prefersStatusBarHidden { return self.landscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return gOrient; }
+- (BOOL)shouldAutorotate { return YES; }
+- (void)applyOrientation:(BOOL)land {
+    self.landscape = land;
+    gOrient = land ? UIInterfaceOrientationMaskLandscape : UIInterfaceOrientationMaskPortrait;
+    UIInterfaceOrientation want = land ? UIInterfaceOrientationLandscapeRight : UIInterfaceOrientationPortrait;
+    ForceOrientation(self, gOrient, want);
+    [self setNeedsStatusBarAppearanceUpdate];
+    SetBtnContent(self.rotBtn, Sym(land ? @"arrow.down.right.and.arrow.up.left" : @"arrow.up.left.and.arrow.down.right", 19, UIFontWeightSemibold), nil, UIColor.whiteColor, 16, 21);
+}
+- (void)minimize {
+    // Back to the list, sound keeps playing; the mini bar above the tab bar controls it.
+    if (self.landscape) [self applyOrientation:NO]; else gOrient = UIInterfaceOrientationMaskPortrait;
+    self.minimized = YES; gActivePlayer = self; if (self.pl) self.pl.player = nil;
+    [self.hideTimer invalidate];
+    [self dismissViewControllerAnimated:YES completion:^{ MiniShow(self); }];
+}
+- (void)fullStop { MiniHide(); gActivePlayer = nil; self.minimized = NO; [self.player pause]; [self cleanup]; }
+- (void)viewWillAppear:(BOOL)a { [super viewWillAppear:a]; if (self.minimized) { self.minimized = NO; MiniHide(); if (self.pl && UIApplication.sharedApplication.applicationState != UIApplicationStateBackground) self.pl.player = self.player; } gActivePlayer = self; }
+- (void)toggleRotate { [self applyOrientation:!self.landscape]; [self scheduleHide]; }
 - (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleLightContent; }
 - (UIButton *)iconBtn:(NSString *)sym size:(CGFloat)sz sel:(SEL)s {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2381,6 +2496,7 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
     float sp = [UD() floatForKey:@"playspeed"]; self.speed = sp < 0.4 ? 1 : sp;
     self.loop = [UD() boolForKey:@"loop"];
     self.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:self.path]];
+    [self setupBackgroundPlayback];
     UIColor *white = UIColor.whiteColor;
     if (self.audio) {
         AuroraView *a = [[AuroraView alloc] initWithFrame:self.view.bounds]; [self.view addSubview:a];
@@ -2388,7 +2504,7 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
         UIImageView *ic = [[UIImageView alloc] initWithImage:[Sym(@"music.note", 90, UIFontWeightLight) imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]]; ic.tintColor = Theme.accent; ic.contentMode = UIViewContentModeScaleAspectFit; ic.translatesAutoresizingMaskIntoConstraints = NO;
         [card.content addSubview:ic];
         self.art = [UIImageView new]; self.art.translatesAutoresizingMaskIntoConstraints = NO; self.art.contentMode = UIViewContentModeScaleAspectFill; self.art.clipsToBounds = YES; [card.content addSubview:self.art];
-        UILabel *nm = Label(self.path.lastPathComponent.stringByDeletingPathExtension, 20, UIFontWeightHeavy, white); nm.textAlignment = NSTextAlignmentCenter; nm.numberOfLines = 2; [self.view addSubview:nm];
+        UILabel *nm = Label(CleanTitle(self.path.lastPathComponent.stringByDeletingPathExtension), 20, UIFontWeightHeavy, white); nm.textAlignment = NSTextAlignmentCenter; nm.numberOfLines = 2; [self.view addSubview:nm];
         [NSLayoutConstraint activateConstraints:@[
             [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor], [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-90],
             [card.widthAnchor constraintEqualToConstant:250], [card.heightAnchor constraintEqualToConstant:250],
@@ -2398,8 +2514,11 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
         AVAsset *as = self.player.currentItem.asset; __weak PlayerVC *ws = self;
         [as loadValuesAsynchronouslyForKeys:@[ @"commonMetadata" ] completionHandler:^{
             NSArray *items = [AVMetadataItem metadataItemsFromArray:as.commonMetadata filteredByIdentifier:AVMetadataCommonIdentifierArtwork];
-            AVMetadataItem *mi = items.firstObject; NSData *d = mi.dataValue; UIImage *im = d ? [UIImage imageWithData:d] : nil;
-            if (im) dispatch_async(dispatch_get_main_queue(), ^{ ws.art.image = im; });
+            AVMetadataItem *mi = items.firstObject;
+            if (!mi) { [as loadValuesAsynchronouslyForKeys:@[ @"metadata" ] completionHandler:nil]; mi = [AVMetadataItem metadataItemsFromArray:as.metadata filteredByIdentifier:AVMetadataIdentifieriTunesMetadataCoverArt].firstObject; }
+            NSData *d = mi.dataValue; UIImage *im = d ? [UIImage imageWithData:d] : nil;
+            if (!im) { NSString *sc = ThumbPath(ws.path); if ([NSFileManager.defaultManager fileExistsAtPath:sc]) im = [UIImage imageWithContentsOfFile:sc]; }
+            if (im) dispatch_async(dispatch_get_main_queue(), ^{ ws.art.image = im; [ws updateNowPlaying]; if (gActivePlayer == ws) MiniRefresh(); });
         }];
     } else {
         self.pl = [AVPlayerLayer playerLayerWithPlayer:self.player]; self.pl.videoGravity = AVLayerVideoGravityResizeAspect; [self.view.layer addSublayer:self.pl];
@@ -2407,9 +2526,10 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
     self.ui = [UIView new]; self.ui.frame = self.view.bounds; self.ui.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [self.view addSubview:self.ui];
     // top bar
     self.top = [GlassView new]; self.top.translatesAutoresizingMaskIntoConstraints = NO; self.top.radius = 26; [self.ui addSubview:self.top];
-    UIButton *x = [self iconBtn:@"xmark" size:17 sel:@selector(close)];
-    UILabel *tt = Label(self.path.lastPathComponent, 15, UIFontWeightBold, white); tt.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [self.top.content addSubview:x]; [self.top.content addSubview:tt];
+    UIButton *x = [self iconBtn:@"chevron.backward" size:19 sel:@selector(minimize)];
+    UIButton *x2 = [self iconBtn:@"xmark" size:17 sel:@selector(close)];
+    UILabel *tt = Label(CleanTitle(self.path.lastPathComponent), 15, UIFontWeightBold, white); tt.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [self.top.content addSubview:x]; [self.top.content addSubview:x2]; [self.top.content addSubview:tt];
     // bottom panel
     self.bot = [GlassView new]; self.bot.translatesAutoresizingMaskIntoConstraints = NO; self.bot.radius = 34; [self.ui addSubview:self.bot];
     self.slider = [UISlider new]; self.slider.translatesAutoresizingMaskIntoConstraints = NO; self.slider.minimumTrackTintColor = Theme.accent; self.slider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.25];
@@ -2420,21 +2540,22 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
     self.tcur.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightBold]; self.tend.font = self.tcur.font;
     self.spdBtn = [UIButton buttonWithType:UIButtonTypeCustom]; self.spdBtn.translatesAutoresizingMaskIntoConstraints = NO; [self.spdBtn addTarget:self action:@selector(cycleSpeed) forControlEvents:UIControlEventTouchUpInside];
     [self.spdBtn.widthAnchor constraintEqualToConstant:52].active = YES; [self.spdBtn.heightAnchor constraintEqualToConstant:48].active = YES;
+    self.rotBtn = [self iconBtn:@"arrow.up.left.and.arrow.down.right" size:19 sel:@selector(toggleRotate)]; self.rotBtn.hidden = self.audio;
     UIButton *bk = [self iconBtn:@"gobackward.10" size:26 sel:@selector(skipBack)];
     UIButton *fw = [self iconBtn:@"goforward.10" size:26 sel:@selector(skipFwd)];
     GradButton *pb = [GradButton buttonWithType:UIButtonTypeCustom]; pb.translatesAutoresizingMaskIntoConstraints = NO; pb.layer.cornerRadius = 33;
     [pb.widthAnchor constraintEqualToConstant:66].active = YES; [pb.heightAnchor constraintEqualToConstant:66].active = YES; [pb addTarget:self action:@selector(togglePlay) forControlEvents:UIControlEventTouchUpInside];
     self.playBtn = pb;
     self.loopBtn = [UIButton buttonWithType:UIButtonTypeCustom]; self.loopBtn.translatesAutoresizingMaskIntoConstraints = NO; [self.loopBtn addTarget:self action:@selector(toggleLoop) forControlEvents:UIControlEventTouchUpInside];
-    [self.loopBtn.widthAnchor constraintEqualToConstant:52].active = YES; [self.loopBtn.heightAnchor constraintEqualToConstant:48].active = YES;
-    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[ self.spdBtn, bk, pb, fw, self.loopBtn ]]; row.axis = UILayoutConstraintAxisHorizontal; row.alignment = UIStackViewAlignmentCenter; row.distribution = UIStackViewDistributionEqualSpacing; row.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.loopBtn.widthAnchor constraintEqualToConstant:44].active = YES; [self.loopBtn.heightAnchor constraintEqualToConstant:48].active = YES;
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[ self.spdBtn, bk, pb, fw, self.loopBtn, self.rotBtn ]]; row.axis = UILayoutConstraintAxisHorizontal; row.alignment = UIStackViewAlignmentCenter; row.distribution = UIStackViewDistributionEqualSpacing; row.translatesAutoresizingMaskIntoConstraints = NO;
     for (UIView *v in @[ self.slider, self.tcur, self.tend, row ]) [self.bot.content addSubview:v];
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [self.top.topAnchor constraintEqualToAnchor:g.topAnchor constant:8], [self.top.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:14], [self.top.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-14], [self.top.heightAnchor constraintEqualToConstant:56],
+        [self.top.topAnchor constraintEqualToAnchor:g.topAnchor constant:8], [self.top.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:14], [self.top.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-14], [self.top.heightAnchor constraintEqualToConstant:56],
         [x.leadingAnchor constraintEqualToAnchor:self.top.content.leadingAnchor constant:4], [x.centerYAnchor constraintEqualToAnchor:self.top.content.centerYAnchor],
-        [tt.leadingAnchor constraintEqualToAnchor:x.trailingAnchor constant:4], [tt.trailingAnchor constraintEqualToAnchor:self.top.content.trailingAnchor constant:-18], [tt.centerYAnchor constraintEqualToAnchor:self.top.content.centerYAnchor],
-        [self.bot.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:14], [self.bot.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-14], [self.bot.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12], [self.bot.heightAnchor constraintEqualToConstant:172],
+        [tt.leadingAnchor constraintEqualToAnchor:x.trailingAnchor constant:4], [tt.trailingAnchor constraintEqualToAnchor:x2.leadingAnchor constant:-4], [x2.trailingAnchor constraintEqualToAnchor:self.top.content.trailingAnchor constant:-4], [x2.centerYAnchor constraintEqualToAnchor:self.top.content.centerYAnchor], [tt.centerYAnchor constraintEqualToAnchor:self.top.content.centerYAnchor],
+        [self.bot.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:14], [self.bot.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-14], [self.bot.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-12], [self.bot.heightAnchor constraintEqualToConstant:172],
         [self.slider.topAnchor constraintEqualToAnchor:self.bot.content.topAnchor constant:18], [self.slider.leadingAnchor constraintEqualToAnchor:self.bot.content.leadingAnchor constant:22], [self.slider.trailingAnchor constraintEqualToAnchor:self.bot.content.trailingAnchor constant:-22],
         [self.tcur.topAnchor constraintEqualToAnchor:self.slider.bottomAnchor constant:2], [self.tcur.leadingAnchor constraintEqualToAnchor:self.slider.leadingAnchor],
         [self.tend.topAnchor constraintEqualToAnchor:self.slider.bottomAnchor constant:2], [self.tend.trailingAnchor constraintEqualToAnchor:self.slider.trailingAnchor],
@@ -2452,7 +2573,8 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
 - (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; self.pl.frame = self.view.bounds; }
 - (void)viewDidAppear:(BOOL)a {
     [super viewDidAppear:a];
-    if ([UD() objectForKey:@"autoplay"] == nil || [UD() boolForKey:@"autoplay"]) { self.player.defaultRate = self.speed; [self.player playImmediatelyAtRate:self.speed]; }
+    BOOL first = !self.started; self.started = YES;
+    if (first && ([UD() objectForKey:@"autoplay"] == nil || [UD() boolForKey:@"autoplay"])) { self.player.defaultRate = self.speed; [self.player playImmediatelyAtRate:self.speed]; }
     [self refreshButtons]; [self scheduleHide];
 }
 - (void)refreshButtons {
@@ -2460,6 +2582,7 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
     SetBtnContent(self.playBtn, Sym(playing ? @"pause.fill" : @"play.fill", 28, UIFontWeightBold), nil, UIColor.whiteColor, 16, 30);
     SetBtnContent(self.spdBtn, nil, [NSString stringWithFormat:@"%gx", self.speed], UIColor.whiteColor, 16, 0);
     SetBtnContent(self.loopBtn, Sym(@"repeat", 20, UIFontWeightBold), nil, self.loop ? Theme.accent : [UIColor colorWithWhite:1 alpha:0.6], 16, 22);
+    [self updateNowPlaying]; if (gActivePlayer == self) MiniRefresh();
 }
 - (void)tick {
     AVPlayerItem *it = self.player.currentItem;
@@ -2477,6 +2600,59 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
     static const void *k = &k; NSNumber *last = objc_getAssociatedObject(self, k);
     if (!last || last.boolValue != playing) { objc_setAssociatedObject(self, k, @(playing), OBJC_ASSOCIATION_RETAIN); [self refreshButtons]; }
 }
+- (void)setupBackgroundPlayback {
+    // Keeps sound going when the app is left or the phone is locked (needs UIBackgroundModes audio, no special entitlement).
+    AVAudioSession *as = [AVAudioSession sharedInstance];
+    [as setCategory:AVAudioSessionCategoryPlayback mode:AVAudioSessionModeMoviePlayback options:0 error:nil];
+    [as setActive:YES error:nil];
+    MPRemoteCommandCenter *cc = [MPRemoteCommandCenter sharedCommandCenter];
+    self.remoteTokens = [NSMutableArray array];
+    __weak PlayerVC *ws = self;
+    cc.skipForwardCommand.preferredIntervals = @[ @10 ]; cc.skipBackwardCommand.preferredIntervals = @[ @10 ];
+    for (MPRemoteCommand *c in @[ cc.playCommand, cc.pauseCommand, cc.togglePlayPauseCommand, cc.skipForwardCommand, cc.skipBackwardCommand, cc.changePlaybackPositionCommand ]) c.enabled = YES;
+    cc.nextTrackCommand.enabled = NO; cc.previousTrackCommand.enabled = NO;
+    [self.remoteTokens addObject:@[ cc.playCommand, [cc.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { PlayerVC *s = ws; if (!s) return MPRemoteCommandHandlerStatusCommandFailed; s.player.defaultRate = s.speed; [s.player playImmediatelyAtRate:s.speed]; [s refreshButtons]; return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [self.remoteTokens addObject:@[ cc.pauseCommand, [cc.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { PlayerVC *s = ws; if (!s) return MPRemoteCommandHandlerStatusCommandFailed; [s.player pause]; [s refreshButtons]; return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [self.remoteTokens addObject:@[ cc.togglePlayPauseCommand, [cc.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { PlayerVC *s = ws; if (!s) return MPRemoteCommandHandlerStatusCommandFailed; [s togglePlay]; return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [self.remoteTokens addObject:@[ cc.skipForwardCommand, [cc.skipForwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { [ws seekBy:10]; return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [self.remoteTokens addObject:@[ cc.skipBackwardCommand, [cc.skipBackwardCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) { [ws seekBy:-10]; return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [self.remoteTokens addObject:@[ cc.changePlaybackPositionCommand, [cc.changePlaybackPositionCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *e) {
+        PlayerVC *s = ws; if (!s) return MPRemoteCommandHandlerStatusCommandFailed;
+        [s.player seekToTime:CMTimeMakeWithSeconds(((MPChangePlaybackPositionCommandEvent *)e).positionTime, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL f) { [s updateNowPlaying]; }];
+        return MPRemoteCommandHandlerStatusSuccess; }] ]];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appBackground) name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appForeground) name:UIApplicationWillEnterForegroundNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(audioInterrupted:) name:AVAudioSessionInterruptionNotification object:nil];
+}
+// A video layer attached to the player makes iOS pause it in the background; detach it so only the sound continues.
+- (void)appBackground { if (self.pl) self.pl.player = nil; [self updateNowPlaying]; }
+- (void)appForeground { if (self.pl && !self.minimized) self.pl.player = self.player; [self refreshButtons]; }
+- (void)audioInterrupted:(NSNotification *)n {
+    if ([n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded && [n.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue] & AVAudioSessionInterruptionOptionShouldResume) {
+        [[AVAudioSession sharedInstance] setActive:YES error:nil]; self.player.defaultRate = self.speed; [self.player playImmediatelyAtRate:self.speed];
+    }
+    [self refreshButtons];
+}
+- (void)updateNowPlaying {
+    AVPlayerItem *it = self.player.currentItem; double dur = CMTimeGetSeconds(it.duration), cur = CMTimeGetSeconds(self.player.currentTime);
+    BOOL playing = self.player.timeControlStatus != AVPlayerTimeControlStatusPaused;
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[MPMediaItemPropertyTitle] = CleanTitle(self.path.lastPathComponent.stringByDeletingPathExtension);
+    d[MPMediaItemPropertyArtist] = @"Flow";
+    if (isfinite(dur) && dur > 0) d[MPMediaItemPropertyPlaybackDuration] = @(dur);
+    if (isfinite(cur)) d[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(cur);
+    d[MPNowPlayingInfoPropertyPlaybackRate] = @(playing ? self.speed : 0);
+    d[MPNowPlayingInfoPropertyDefaultPlaybackRate] = @(self.speed);
+    UIImage *art = self.art.image;
+    if (art) d[MPMediaItemPropertyArtwork] = [[MPMediaItemArtwork alloc] initWithBoundsSize:art.size requestHandler:^UIImage *(CGSize s) { return art; }];
+    MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo = d;
+}
+- (void)teardownBackgroundPlayback {
+    for (NSArray *t in self.remoteTokens) [t[0] removeTarget:t[1]];
+    self.remoteTokens = nil;
+    MPNowPlayingInfoCenter.defaultCenter.nowPlayingInfo = nil;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil]; });
+}
 - (void)togglePlay {
     if (self.player.timeControlStatus == AVPlayerTimeControlStatusPaused) {
         double dur = CMTimeGetSeconds(self.player.currentItem.duration);
@@ -2488,14 +2664,14 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
 - (void)seekBy:(double)d {
     double dur = CMTimeGetSeconds(self.player.currentItem.duration); double t = CMTimeGetSeconds(self.player.currentTime) + d;
     t = MAX(0, isfinite(dur) && dur > 0 ? MIN(t, dur) : t);
-    [self.player seekToTime:CMTimeMakeWithSeconds(t, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero]; [self tick];
+    [self.player seekToTime:CMTimeMakeWithSeconds(t, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero]; [self tick]; [self updateNowPlaying];
 }
 - (void)skipBack { [self seekBy:-10]; [self scheduleHide]; }
 - (void)skipFwd { [self seekBy:10]; [self scheduleHide]; }
 - (void)doubleTap:(UITapGestureRecognizer *)g { [self seekBy:[g locationInView:self.view].x < self.view.bounds.size.width / 2 ? -10 : 10]; }
 - (void)scrubStart { self.scrubbing = YES; [self.hideTimer invalidate]; }
 - (void)scrubMove { self.tcur.text = FmtDur(self.slider.value); [self.player seekToTime:CMTimeMakeWithSeconds(self.slider.value, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero]; }
-- (void)scrubEnd { self.scrubbing = NO; [self scheduleHide]; }
+- (void)scrubEnd { self.scrubbing = NO; [self updateNowPlaying]; [self scheduleHide]; }
 - (void)cycleSpeed {
     NSArray *s = @[ @0.5, @0.75, @1, @1.25, @1.5, @2 ]; NSInteger i = 2;
     for (NSInteger j = 0; j < (NSInteger)s.count; j++) if (fabsf([s[j] floatValue] - self.speed) < 0.01) i = j;
@@ -2520,10 +2696,16 @@ static void TogglePin(NSString *p) { NSMutableArray *a = Pins(); NSString *r = R
 - (void)cleanup {
     if (self.closing) return; self.closing = YES;
     [self.hideTimer invalidate]; if (self.timeObs) { [self.player removeTimeObserver:self.timeObs]; self.timeObs = nil; }
-    [[NSNotificationCenter defaultCenter] removeObserver:self]; [self.player pause];
+    [[NSNotificationCenter defaultCenter] removeObserver:self]; [self.player pause]; [self teardownBackgroundPlayback];
 }
-- (void)close { [self cleanup]; [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)viewDidDisappear:(BOOL)a { [super viewDidDisappear:a]; if (self.isBeingDismissed || self.presentingViewController == nil) [self cleanup]; }
+- (void)close {
+    // Stop the sound and start dismissing right away; the slow teardown (audio session) happens afterwards on a background queue.
+    [self.player pause]; MiniHide(); if (gActivePlayer == self) gActivePlayer = nil;
+    if (self.landscape) [self applyOrientation:NO]; else gOrient = UIInterfaceOrientationMaskPortrait;
+    [self dismissViewControllerAnimated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self cleanup]; });
+}
+- (void)viewDidDisappear:(BOOL)a { [super viewDidDisappear:a]; if (self.minimized) return; if (self.isBeingDismissed || self.presentingViewController == nil) { [self cleanup]; if (gOrient != UIInterfaceOrientationMaskPortrait) { gOrient = UIInterfaceOrientationMaskPortrait; ForceOrientation(self, gOrient, UIInterfaceOrientationPortrait); } } }
 @end
 static void OpenFile(UIViewController *vc, NSString *path) {
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) return;
@@ -2531,6 +2713,7 @@ static void OpenFile(UIViewController *vc, NSString *path) {
     if (k == 2 || k == 3) {
         [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil]; [[AVAudioSession sharedInstance] setActive:YES error:nil];
         @try {
+            if (gActivePlayer) [gActivePlayer fullStop];
             PlayerVC *p = [PlayerVC new]; p.path = path; p.modalPresentationStyle = UIModalPresentationFullScreen; (void)p.view;
             [vc presentViewController:p animated:YES completion:nil];
         } @catch (NSException *e) {
@@ -2599,15 +2782,135 @@ static void OpenFile(UIViewController *vc, NSString *path) {
 
 static UIDocumentInteractionController *gDIC;
 
+#pragma mark - Fetch missing covers (iTunes Search, Deezer fallback)
+
+@interface CoverJob : NSObject
+@property(atomic) BOOL cancel;
+@property(atomic) NSInteger total, done, found;
+@end
+@implementation CoverJob @end
+
+static NSData *EmbeddedArtData(NSString *path) {
+    AVURLAsset *as = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [as loadValuesAsynchronouslyForKeys:@[ @"commonMetadata", @"metadata" ] completionHandler:^{ dispatch_semaphore_signal(sem); }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+    AVMetadataItem *mi = [AVMetadataItem metadataItemsFromArray:as.commonMetadata filteredByIdentifier:AVMetadataCommonIdentifierArtwork].firstObject;
+    if (!mi) mi = [AVMetadataItem metadataItemsFromArray:as.metadata filteredByIdentifier:AVMetadataIdentifieriTunesMetadataCoverArt].firstObject;
+    if (!mi) mi = [AVMetadataItem metadataItemsFromArray:as.metadata filteredByIdentifier:AVMetadataIdentifierID3MetadataAttachedPicture].firstObject;
+    return mi.dataValue;
+}
+static BOOL TokIsAr(NSString *t) { for (NSUInteger i = 0; i < t.length; i++) { unichar c = [t characterAtIndex:i]; if (c >= 0x0600 && c <= 0x06FF) return YES; } return NO; }
+static NSString *CoverNorm(NSString *s) {
+    NSMutableString *m = [[s stringByFoldingWithOptions:NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch | NSWidthInsensitiveSearch locale:nil] mutableCopy];
+    for (NSArray *p in @[ @[ @"أ", @"ا" ], @[ @"إ", @"ا" ], @[ @"آ", @"ا" ], @[ @"ٱ", @"ا" ], @[ @"ى", @"ي" ], @[ @"ة", @"ه" ], @[ @"ـ", @"" ], @[ @"ؤ", @"و" ], @[ @"ئ", @"ي" ] ]) [m replaceOccurrencesOfString:p[0] withString:p[1] options:0 range:NSMakeRange(0, m.length)];
+    return m;
+}
+static NSArray<NSString *> *CoverTokens(NSString *s) {
+    static NSSet *stop; if (!stop) stop = [NSSet setWithArray:@[ @"the", @"feat", @"ft", @"and", @"with", @"mp3", @"m4a", @"official", @"audio", @"video", @"lyrics", @"lyric", @"من", @"في" ]];
+    NSMutableArray *r = [NSMutableArray array];
+    for (NSString *t in [CoverNorm(s) componentsSeparatedByCharactersInSet:NSCharacterSet.alphanumericCharacterSet.invertedSet]) if (t.length >= 2 && ![stop containsObject:t]) [r addObject:t];
+    return r;
+}
+static NSString *CoverCleanName(NSString *file) {
+    NSString *s = CleanTitle(file.stringByDeletingPathExtension);
+    for (NSString *pat in @[ @"\\[[^\\]]*\\]", @"\\([^)]*\\)", @"(?i)\\b(official|audio|video|lyrics?|music video|clip|hd|hq|mp3|m4a|\\d{2,3} ?k(bps)?)\\b", @"كليب|اوديو|أوديو|كلمات" ]) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+        if (re) s = [re stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@" "];
+    }
+    s = [[s stringByReplacingOccurrencesOfString:@"_" withString:@" "] stringByReplacingOccurrencesOfString:@"|" withString:@" "];
+    return [[s componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet] componentsJoinedByString:@" "];
+}
+static NSData *CoverGET(NSString *url, NSInteger *status) {
+    NSURL *u = [NSURL URLWithString:url]; if (!u) return nil;
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.timeoutInterval = 15;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block NSData *out = nil; __block NSInteger st = 0;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        st = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0; if (!e && st == 200) out = d; dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    if (status) *status = st; return out;
+}
+// Conservative: the candidate's own words must be found in the file name (same script), and the artist must be present too.
+static double CoverScore(NSArray *fileToks, NSString *title, NSString *artist) {
+    NSArray *T = CoverTokens(title), *A = CoverTokens(artist);
+    if (!T.count || !A.count) return 0;
+    NSMutableArray *all = [NSMutableArray arrayWithArray:T]; [all addObjectsFromArray:A];
+    NSInteger ar = 0; for (NSString *t in all) if (TokIsAr(t)) ar++;
+    BOOL cAr = ar * 2 > (NSInteger)all.count;
+    NSMutableSet *F = [NSMutableSet set]; for (NSString *t in fileToks) if (TokIsAr(t) == cAr) [F addObject:t];
+    if (!F.count) return 0;
+    NSInteger tHit = 0; for (NSString *t in T) if ([F containsObject:t]) tHit++;
+    NSInteger aHit = 0; for (NSString *t in A) if ([F containsObject:t]) aHit++;
+    double tc = (double)tHit / T.count;
+    if (tc < 0.99 || aHit == 0) return 0;
+    NSMutableSet *U = [NSMutableSet setWithArray:all]; NSInteger fHit = 0; for (NSString *t in F) if ([U containsObject:t]) fHit++;
+    double fc = (double)fHit / F.count;
+    return fc < 0.7 ? 0 : fc;
+}
+static NSData *CoverJPEG600(NSData *d) {
+    if (!d.length) return nil;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)d, NULL); if (!src) return nil;
+    CGImageRef cg = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)@{ (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES, (id)kCGImageSourceThumbnailMaxPixelSize: @600, (id)kCGImageSourceCreateThumbnailWithTransform: @YES });
+    CFRelease(src); if (!cg) return nil;
+    UIImage *i = [UIImage imageWithCGImage:cg]; CGImageRelease(cg);
+    if (i.size.width < 100) return nil;
+    return UIImageJPEGRepresentation(i, 0.88);
+}
+// Returns JPEG data of the best confident match, or nil.
+static NSData *CoverLookup(NSString *q, NSArray *fileToks, CoverJob *job) {
+    NSString *enc = [q stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+    // iTunes (about 20 requests a minute are allowed, so keep a gap)
+    NSInteger st = 0;
+    NSData *d = CoverGET([NSString stringWithFormat:@"https://itunes.apple.com/search?term=%@&entity=song&limit=10", enc], &st);
+    [NSThread sleepForTimeInterval:3.2];
+    if (st == 403 || st == 429) [NSThread sleepForTimeInterval:15];
+    if (job.cancel) return nil;
+    NSString *best = nil; double bs = 0;
+    NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    for (NSDictionary *r in [j[@"results"] isKindOfClass:NSArray.class] ? j[@"results"] : @[]) {
+        double s = CoverScore(fileToks, r[@"trackName"] ?: @"", r[@"artistName"] ?: @"");
+        NSString *art = r[@"artworkUrl100"]; if (s > bs && art.length) { bs = s; best = [art stringByReplacingOccurrencesOfString:@"100x100bb" withString:@"600x600bb"]; }
+    }
+    if (best) { NSData *img = CoverJPEG600(CoverGET(best, NULL)); if (img) return img; }
+    if (job.cancel) return nil;
+    // Deezer fallback
+    d = CoverGET([NSString stringWithFormat:@"https://api.deezer.com/search?q=%@&limit=10", enc], &st);
+    [NSThread sleepForTimeInterval:1.2];
+    j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; best = nil; bs = 0;
+    for (NSDictionary *r in [j[@"data"] isKindOfClass:NSArray.class] ? j[@"data"] : @[]) {
+        if (![r isKindOfClass:NSDictionary.class]) continue;
+        NSString *art = r[@"album"][@"cover_xl"] ?: r[@"album"][@"cover_big"];
+        double s = CoverScore(fileToks, r[@"title"] ?: @"", r[@"artist"][@"name"] ?: @"");
+        if (s > bs && art.length) { bs = s; best = art; }
+    }
+    if (best) return CoverJPEG600(CoverGET(best, NULL));
+    return nil;
+}
+static NSData *CoverFind(NSString *fileName, CoverJob *job) {
+    NSString *clean = CoverCleanName(fileName);
+    NSArray *ft = CoverTokens(clean);
+    if (ft.count < 2) return nil;
+    NSMutableArray *lat = [NSMutableArray array], *arb = [NSMutableArray array];
+    for (NSString *w in [clean componentsSeparatedByString:@" "]) { NSArray *t = CoverTokens(w); if (!t.count) continue; [(TokIsAr(t[0]) ? arb : lat) addObject:w]; }
+    NSMutableArray *qs = [NSMutableArray arrayWithObject:clean];
+    NSString *ql = [lat componentsJoinedByString:@" "], *qa = [arb componentsJoinedByString:@" "];
+    if (lat.count >= 2 && ![ql isEqualToString:clean]) [qs addObject:ql];
+    if (arb.count >= 2 && ![qa isEqualToString:clean]) [qs addObject:qa];
+    for (NSString *q in qs) { if (job.cancel) return nil; NSData *r = CoverLookup(q, ft, job); if (r) return r; }
+    return nil;
+}
+
 @interface FilesVC : BaseVC <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate, UIDocumentPickerDelegate>
 @property(nonatomic, copy) NSString *dir;
 @property(nonatomic, strong) UITableView *table;
 @property(nonatomic, strong) NSArray<NSString *> *items;
 @property(nonatomic, strong) UISegmentedControl *seg;
 @property(nonatomic, strong) UISearchBar *search;
-@property(nonatomic, strong) UIView *header, *empty;
+@property(nonatomic, strong) UIView *header, *empty, *emptyFilter;
+@property(nonatomic, strong) NSLayoutConstraint *emptyTop, *emptyTop2;
 @property(nonatomic, copy) NSString *listSig;
-@property(nonatomic) BOOL selecting;
+@property(nonatomic) BOOL selecting, loading, reloadAgain, endPull;
 @property(nonatomic, strong) NSMutableSet<NSString *> *sel;
 @end
 @implementation FilesVC
@@ -2632,6 +2935,7 @@ static UIDocumentInteractionController *gDIC;
     self.title = root ? @"My Files" : self.dir.lastPathComponent;
     self.navigationItem.largeTitleDisplayMode = root ? UINavigationItemLargeTitleDisplayModeAlways : UINavigationItemLargeTitleDisplayModeNever;
     self.table = MakeTable(self); [self.view addSubview:self.table];
+    AddPull(self.table, self);
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[ [self.table.topAnchor constraintEqualToAnchor:g.topAnchor], [self.table.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [self.table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [self.table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor] ]];
@@ -2655,16 +2959,21 @@ static UIDocumentInteractionController *gDIC;
         [self.seg.topAnchor constraintEqualToAnchor:self.search.bottomAnchor constant:6], [self.seg.leadingAnchor constraintEqualToAnchor:self.header.leadingAnchor constant:16], [self.seg.trailingAnchor constraintEqualToAnchor:self.header.trailingAnchor constant:-16], [self.seg.heightAnchor constraintEqualToConstant:34] ]];
     self.table.tableHeaderView = self.header;
     self.empty = EmptyState(@"folder", T(@"This folder is empty"), T(@"Use + to add a folder or import files."));
-    [self.view addSubview:self.empty];
-    NSLayoutConstraint *ecy = [self.empty.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:90]; ecy.priority = UILayoutPriorityDefaultHigh;
-    // always below the header (quick tiles, search, filter chips), never on top of it
-    [NSLayoutConstraint activateConstraints:@[ [self.empty.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor], ecy, [self.empty.topAnchor constraintGreaterThanOrEqualToAnchor:g.topAnchor constant:206 + 24], [self.empty.widthAnchor constraintLessThanOrEqualToConstant:280] ]];
+    self.emptyFilter = EmptyState(@"magnifyingglass", L(@"Nothing here", @"مفيش حاجة هنا"), L(@"No items match this filter or search.", @"مفيش عناصر بتطابق الفلتر أو البحث ده."));
+    // Empty states live inside the table's scroll content, directly under the header, so they move exactly with it (no lag while pulling).
+    for (UIView *ev in @[ self.empty, self.emptyFilter ]) { ev.translatesAutoresizingMaskIntoConstraints = YES; ev.userInteractionEnabled = NO; [self.table addSubview:ev]; }
+    self.emptyFilter.hidden = YES;
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reload) name:NotifJobs object:nil];
     [self updateBar];
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGFloat w = self.table.bounds.size.width;
+    for (UIView *ev in @[ self.empty, self.emptyFilter ]) {
+        CGSize sz = [ev systemLayoutSizeFittingSize:CGSizeMake(MIN(280, w), 0) withHorizontalFittingPriority:UILayoutPriorityRequired verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
+        CGFloat cy = self.view.bounds.size.height / 2 + 90 - self.table.frame.origin.y;   // same resting spot as before: a bit below the middle of the screen
+        ev.frame = CGRectMake(floor((w - sz.width) / 2), MAX(206 + 36, floor(cy - sz.height / 2)), sz.width, sz.height);
+    }
     if (self.header.frame.size.width != w) {
         self.header.frame = CGRectMake(0, 0, w, 206);
         self.table.tableHeaderView = self.header;
@@ -2674,12 +2983,71 @@ static UIDocumentInteractionController *gDIC;
 - (void)themeChanged { [super themeChanged]; [self.table reloadData]; }
 - (void)searchBar:(UISearchBar *)b textDidChange:(NSString *)t { [self reload]; }
 - (void)searchBarSearchButtonClicked:(UISearchBar *)b { [b resignFirstResponder]; }
+- (void)fetchCovers {
+    NSString *dir = self.dir; CoverJob *job = [CoverJob new];
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:L(@"Fetching covers", @"بجيب الأغلفة") message:L(@"Scanning audio files...", @"بفحص ملفات الصوت...") preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:L(@"Cancel", @"إلغاء") style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) { job.cancel = YES; }]];
+    [self presentViewController:al animated:YES completion:nil];
+    __weak FilesVC *ws = self; __weak UIAlertController *wal = al;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableArray *todo = [NSMutableArray array];
+        for (NSString *n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]) {
+            if ([n hasPrefix:@"."]) continue;
+            NSString *p = [dir stringByAppendingPathComponent:n];
+            if (KindOf(p) != 3 || [NSFileManager.defaultManager fileExistsAtPath:ThumbPath(p)]) continue;
+            if (EmbeddedArtData(p).length) continue;
+            [todo addObject:n];
+        }
+        job.total = todo.count;
+        for (NSString *n in todo) {
+            if (job.cancel) break;
+            dispatch_async(dispatch_get_main_queue(), ^{ wal.message = [NSString stringWithFormat:@"%@ %ld / %ld\n%@", L(@"Checked", @"اتفحص"), (long)job.done, (long)job.total, CleanTitle(n.stringByDeletingPathExtension)]; });
+            NSData *img = CoverFind(n, job);
+            if (img && !job.cancel) { [img writeToFile:ThumbPath([dir stringByAppendingPathComponent:n]) atomically:YES]; job.found++; }
+            job.done++;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [gThumbs removeAllObjects]; [ws reload];
+            void (^summary)(void) = ^{
+                NSString *t = job.total == 0 ? L(@"Every audio file here already has a cover.", @"كل ملفات الصوت هنا عندها غلاف.")
+                    : [NSString stringWithFormat:@"%@ %ld %@ %ld%@", job.cancel ? L(@"Stopped. Found", @"اتوقف. لقيت") : L(@"Found", @"لقيت"), (long)job.found, L(@"of", @"من"), (long)job.total, job.total ? L(@" files without a cover. Songs with no confident match were left alone.", @" ملف من غير غلاف. الأغاني اللي ملقتش ليها تطابق أكيد اتسابت زي ما هي.") : @""];
+                UIAlertController *d = [UIAlertController alertControllerWithTitle:L(@"Covers", @"الأغلفة") message:t preferredStyle:UIAlertControllerStyleAlert];
+                [d addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [ws presentViewController:d animated:YES completion:nil];
+            };
+            if (wal && wal.presentingViewController) [wal dismissViewControllerAnimated:YES completion:summary]; else if (job.cancel) summary();
+        });
+    });
+}
+- (UIMenu *)sortMenu {
+    NSInteger cur = [UD() integerForKey:@"sortby"];
+    NSArray *groups = @[
+        @[ L(@"Date added", @"تاريخ الإضافة"), @[ @[ L(@"Oldest first (newest at the end)", @"الأقدم الأول (الأحدث في الآخر)"), @3 ], @[ L(@"Newest first", @"الأحدث الأول"), @1 ] ] ],
+        @[ L(@"Name", @"الاسم"), @[ @[ L(@"A to Z", @"من أ إلى ي"), @0 ], @[ L(@"Z to A", @"من ي إلى أ"), @4 ] ] ],
+        @[ L(@"Size", @"الحجم"), @[ @[ L(@"Largest first", @"الأكبر الأول"), @2 ], @[ L(@"Smallest first", @"الأصغر الأول"), @5 ] ] ] ];
+    NSMutableArray *secs = [NSMutableArray array];
+    for (NSArray *g in groups) {
+        NSMutableArray *acts = [NSMutableArray array];
+        for (NSArray *o in g[1]) {
+            NSInteger v = [o[1] integerValue];
+            UIAction *a = [UIAction actionWithTitle:o[0] image:nil identifier:nil handler:^(UIAction *x) { [UD() setInteger:v forKey:@"sortby"]; [self updateBar]; [self reload]; }];
+            a.state = v == cur ? UIMenuElementStateOn : UIMenuElementStateOff; [acts addObject:a];
+        }
+        [secs addObject:[UIMenu menuWithTitle:g[0] image:nil identifier:nil options:UIMenuOptionsDisplayInline children:acts]];
+    }
+    UIAction *fc = [UIAction actionWithTitle:L(@"Fetch missing covers", @"هات الأغلفة الناقصة") image:[UIImage systemImageNamed:@"photo.on.rectangle.angled"] identifier:nil handler:^(UIAction *x) { [self fetchCovers]; }];
+    [secs addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[ fc ]]];
+    return [UIMenu menuWithTitle:L(@"Sort by", @"ترتيب حسب") children:secs];
+}
 - (void)updateBar {
     NSString *t = self.selecting ? (self.sel.count ? [NSString stringWithFormat:@"%@ (%lu)", T(@"Delete"), (unsigned long)self.sel.count] : T(@"Done ")) : nil;
     if (!t) {
         BOOL full = TrashItems().count > 0;
         UIBarButtonItem *tb = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:full ? @"trash.fill" : @"trash"] style:UIBarButtonItemStylePlain target:self action:@selector(openTrash)];
-        tb.accessibilityLabel = L(@"Trash", @"سلة المحذوفات"); tb.tintColor = Theme.accent; self.navigationItem.rightBarButtonItem = tb; return; }
+        tb.accessibilityLabel = L(@"Trash", @"سلة المحذوفات"); tb.tintColor = Theme.accent;
+        UIBarButtonItem *sb = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"arrow.up.arrow.down.circle"] menu:[self sortMenu]];
+        sb.accessibilityLabel = L(@"Sort", @"ترتيب"); sb.tintColor = Theme.accent;
+        self.navigationItem.rightBarButtonItems = @[ tb, sb ]; return; }
     UIBarButtonItem *b = [[UIBarButtonItem alloc] initWithTitle:t style:UIBarButtonItemStylePlain target:self action:@selector(barTapped)];
     b.tintColor = self.sel.count ? [UIColor systemRedColor] : Theme.accent; self.navigationItem.rightBarButtonItem = b;
 }
@@ -2695,46 +3063,65 @@ static UIDocumentInteractionController *gDIC;
         [self presentViewController:a animated:YES completion:nil];
     } else [self toggleSelect];
 }
+// The folder is scanned and sorted on a background queue (big folders took seconds on the main thread and froze pull-to-refresh).
+// Attributes are read once per file, not once per sort comparison.
 - (void)reload {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSMutableArray *all = [NSMutableArray array];
-    for (NSString *n in [fm contentsOfDirectoryAtPath:self.dir error:nil]) {
-        if (IsInternalName(n)) continue;
-        if ([n hasPrefix:@"."]) continue;
-        NSString *p = [self.dir stringByAppendingPathComponent:n];
-        int k = KindOf(p); NSInteger f = self.seg.selectedSegmentIndex;
-        if (f == 1 && k != 0) continue;
-        if (f == 2 && k != 1) continue;
-        if (f == 3 && k != 2) continue;
-        if (f == 4 && k != 3) continue;
-        if (f == 5 && !(k == 4 || k == 5 || k == 6)) continue;
-        NSString *q = self.search.text;
-        if (q.length && [n rangeOfString:q options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
-        [all addObject:p];
-    }
+    if (self.loading) { self.reloadAgain = YES; return; }
+    self.loading = YES;
+    NSString *dir = self.dir, *q = self.search.text ?: @""; NSInteger f = self.seg.selectedSegmentIndex;
     NSInteger sort = [UD() integerForKey:@"sortby"]; BOOL foldersFirst = [UD() objectForKey:@"foldersfirst"] == nil || [UD() boolForKey:@"foldersfirst"];
-    [all sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        BOOL pa = IsPinned(a), pb = IsPinned(b); if (pa != pb) return pa ? NSOrderedAscending : NSOrderedDescending;
-        if (foldersFirst) { int ka = KindOf(a) == 0, kb = KindOf(b) == 0; if (ka != kb) return ka ? NSOrderedAscending : NSOrderedDescending; }
-        if (sort == 1) { NSDate *da = [[NSFileManager.defaultManager attributesOfItemAtPath:a error:nil] fileModificationDate], *db = [[NSFileManager.defaultManager attributesOfItemAtPath:b error:nil] fileModificationDate]; return [db compare:da ?: NSDate.distantPast]; }
-        if (sort == 2) { int64_t sa = SizeOf(a), sb = SizeOf(b); return sa == sb ? NSOrderedSame : (sa > sb ? NSOrderedAscending : NSOrderedDescending); }
-        return [a.lastPathComponent localizedStandardCompare:b.lastPathComponent];
-    }];
-    self.empty.hidden = all.count > 0 || self.search.text.length || self.seg.selectedSegmentIndex != 0;
-    // The download timer calls reload twice a second. Only rebuild the table when the list really changed,
-    // otherwise the header is re-laid out and jumps. Sizes of growing files are refreshed in place.
-    NSString *sig = [NSString stringWithFormat:@"%@|%ld|%@|%d|%lu|%ld", [all componentsJoinedByString:@"\n"], (long)self.seg.selectedSegmentIndex, self.search.text ?: @"", (int)self.selecting, (unsigned long)self.sel.count, (long)(IsAr() ? 1 : 0)];
-    BOOL same = self.listSig && [sig isEqualToString:self.listSig] && self.items.count == all.count;
-    self.items = all; self.listSig = sig;
-    if (same) { NSArray *vis = self.table.indexPathsForVisibleRows; if (vis.count) [UIView performWithoutAnimation:^{ [self.table reloadRowsAtIndexPaths:vis withRowAnimation:UITableViewRowAnimationNone]; }]; return; }
-    [self.table reloadData];
+    BOOL sel = self.selecting; NSUInteger selN = self.sel.count; BOOL ar = IsAr();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSMutableArray *all = [NSMutableArray array]; NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        for (NSString *n in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (IsInternalName(n)) continue;
+            if ([n hasPrefix:@"."]) continue;
+            NSString *p = [dir stringByAppendingPathComponent:n];
+            int k = KindOf(p);
+            if (f == 1 && k != 0) continue;
+            if (f == 2 && k != 1) continue;
+            if (f == 3 && k != 2) continue;
+            if (f == 4 && k != 3) continue;
+            if (f == 5 && !(k == 4 || k == 5 || k == 6)) continue;
+            if (q.length && [n rangeOfString:q options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            NSMutableDictionary *d = [NSMutableDictionary dictionaryWithObjectsAndKeys:@(k == 0), @"folder", @(IsPinned(p)), @"pin", nil];
+            if (sort == 1 || sort == 3) { NSDictionary *at = [fm attributesOfItemAtPath:p error:nil]; d[@"date"] = at.fileCreationDate ?: at.fileModificationDate ?: NSDate.distantPast; }
+            if (sort == 2 || sort == 5) d[@"size"] = @(SizeOf(p));
+            info[p] = d; [all addObject:p];
+        }
+        [all sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSDictionary *ia = info[a], *ib = info[b];
+            BOOL pa = [ia[@"pin"] boolValue], pb = [ib[@"pin"] boolValue]; if (pa != pb) return pa ? NSOrderedAscending : NSOrderedDescending;
+            if (foldersFirst) { BOOL ka = [ia[@"folder"] boolValue], kb = [ib[@"folder"] boolValue]; if (ka != kb) return ka ? NSOrderedAscending : NSOrderedDescending; }
+            if (sort == 1 || sort == 3) { NSComparisonResult r = [ia[@"date"] compare:ib[@"date"]]; if (r != NSOrderedSame) return sort == 1 ? -r : r; }
+            if (sort == 2 || sort == 5) { int64_t sa = [ia[@"size"] longLongValue], sb = [ib[@"size"] longLongValue]; if (sa != sb) return (sa > sb) == (sort == 2) ? NSOrderedAscending : NSOrderedDescending; }
+            if (sort == 4) return [b.lastPathComponent localizedStandardCompare:a.lastPathComponent];
+            return [a.lastPathComponent localizedStandardCompare:b.lastPathComponent];
+        }];
+        NSString *sig = [NSString stringWithFormat:@"%@|%ld|%@|%d|%lu|%ld|%ld", [all componentsJoinedByString:@"\n"], (long)f, q, (int)sel, (unsigned long)selN, (long)(ar ? 1 : 0), (long)sort];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.loading = NO;
+            if (![dir isEqualToString:self.dir]) return;
+            BOOL filtered = self.search.text.length || self.seg.selectedSegmentIndex != 0;
+            self.empty.hidden = all.count > 0 || filtered;
+            self.emptyFilter.hidden = all.count > 0 || !filtered;
+            // Only rebuild the table when the list really changed, otherwise the header jumps. Sizes of growing files refresh in place.
+            BOOL same = self.listSig && [sig isEqualToString:self.listSig] && self.items.count == all.count;
+            self.items = all; self.listSig = sig;
+            if (same) { NSArray *vis = self.table.indexPathsForVisibleRows; if (vis.count) [UIView performWithoutAnimation:^{ [self.table reloadRowsAtIndexPaths:vis withRowAnimation:UITableViewRowAnimationNone]; }]; }
+            else [self.table reloadData];
+            if (self.endPull) { self.endPull = NO; EndPull(self.table); }
+            if (self.reloadAgain) { self.reloadAgain = NO; [self reload]; }
+        });
+    });
 }
 - (NSInteger)tableView:(UITableView *)t numberOfRowsInSection:(NSInteger)s { return self.items.count; }
 - (NSString *)kindName:(int)k { return @[ L(@"Folder", @"مجلد"), L(@"Image", @"صورة"), L(@"Video", @"فيديو"), L(@"Audio", @"صوت"), L(@"Document", @"مستند"), L(@"Archive", @"أرشيف"), L(@"File", @"ملف") ][k]; }
 - (UITableViewCell *)tableView:(UITableView *)t cellForRowAtIndexPath:(NSIndexPath *)ip {
     RowCell *c = [t dequeueReusableCellWithIdentifier:@"f"] ?: [[RowCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"f"];
     NSString *p = self.items[ip.row]; int k = KindOf(p);
-    c.title.text = p.lastPathComponent; c.represent = p;
+    c.title.text = CleanTitle(p.lastPathComponent); c.represent = p;
     [c setSymbol:KindSymbol(k) color:KindColor(k) ring:-1];
     [c setPillText:[self kindName:k] color:[KindColor(k) colorWithAlphaComponent:0.9]];
     NSString *pin = IsPinned(p) ? [NSString stringWithFormat:@"  ·  %@", L(@"Pinned", @"مثبت")] : @"";
@@ -2747,7 +3134,7 @@ static UIDocumentInteractionController *gDIC;
         if (IsAr()) f.locale = [NSLocale localeWithLocaleIdentifier:@"ar_EG"];
         c.sub.text = [NSString stringWithFormat:@"%@  ·  %@%@", FmtSize(SizeOf(p)), d ? [f stringFromDate:d] : @"", pin];
     }
-    if (k == 1 || k == 2 || [NSFileManager.defaultManager fileExistsAtPath:ThumbPath(p)]) { __weak RowCell *w = c; ThumbFor(p, ^(UIImage *i) { if ([w.represent isEqualToString:p]) [w setThumbImage:i]; }); }
+    if (k == 1 || k == 2 || k == 3 || [NSFileManager.defaultManager fileExistsAtPath:ThumbPath(p)]) { __weak RowCell *w = c; ThumbFor(p, ^(UIImage *i) { if ([w.represent isEqualToString:p]) [w setThumbImage:i]; }); }
     c.more.menu = [self menuFor:p];
     [c setSelecting:self.selecting selected:[self.sel containsObject:p]];
     return c;
@@ -2910,6 +3297,7 @@ static UIDocumentInteractionController *gDIC;
     UIContextualAction *d = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:T(@"Delete") handler:^(UIContextualAction *a, UIView *v, void (^h)(BOOL)) { [self confirmDelete:p]; h(YES); }];
     return [UISwipeActionsConfiguration configurationWithActions:@[ d ]];
 }
+- (void)pullRefresh { self.listSig = nil; self.endPull = YES; [self updateBar]; [self reload]; EndPull(self.table); }
 @end
 #pragma mark - Settings (grouped pages)
 
@@ -3207,8 +3595,8 @@ static NSArray *SettingsPageByKey(NSString *key, PageVC *p) {
     if ([key isEqualToString:@"downloads"]) return DownloadsPage(p);
     if ([key isEqualToString:@"filesettings"]) {
         NSInteger sort = [UD() integerForKey:@"sortby"]; NSMutableArray *rows = [NSMutableArray array];
-        NSArray *n = @[ L(@"Name", @"الاسم"), L(@"Date modified", @"تاريخ التعديل"), L(@"Size", @"الحجم") ], *ic = @[ @"textformat", @"calendar", @"arrow.up.arrow.down" ];
-        for (NSInteger i = 0; i < 3; i++) [rows addObject:CheckRow(ic[i], Theme.accent, n[i], i == sort, ^{ [UD() setInteger:i forKey:@"sortby"]; [wp rebuild]; })];
+        NSArray *opts = @[ @[ L(@"Date added, oldest first", @"تاريخ الإضافة، الأقدم الأول"), @3, @"calendar" ], @[ L(@"Date added, newest first", @"تاريخ الإضافة، الأحدث الأول"), @1, @"calendar" ], @[ L(@"Name, A to Z", @"الاسم، من أ إلى ي"), @0, @"textformat" ], @[ L(@"Name, Z to A", @"الاسم، من ي إلى أ"), @4, @"textformat" ], @[ L(@"Size, largest first", @"الحجم، الأكبر الأول"), @2, @"arrow.up.arrow.down" ], @[ L(@"Size, smallest first", @"الحجم، الأصغر الأول"), @5, @"arrow.up.arrow.down" ] ];
+        for (NSArray *o in opts) { NSInteger v = [o[1] integerValue]; [rows addObject:CheckRow(o[2], Theme.accent, o[0], v == sort, ^{ [UD() setInteger:v forKey:@"sortby"]; [wp rebuild]; })]; }
         return @[ Sec(L(@"Sort files by", @"ترتيب الملفات حسب"), rows), Sec(nil, @[ SwitchRow(@"folder.fill", [UIColor systemYellowColor], L(@"Folders first", @"المجلدات الأول"), @"foldersfirst", YES, nil) ]),
                  SecF(nil, @[ Row(@"trash.fill", [UIColor systemRedColor], L(@"Trash", @"سلة المحذوفات"), FmtSize(TrashSize()), @"nav", ^{ [wp.navigationController pushViewController:[TrashVC new] animated:YES]; }), SwitchRow(@"clock.arrow.circlepath", [UIColor systemOrangeColor], L(@"Empty Trash after 30 days", @"فضّي السلة بعد 30 يوم"), @"trashauto", NO, nil) ], L(@"Deleted files go to Trash first. Turn this on to remove items automatically after 30 days.", @"الملفات المحذوفة بتروح السلة الأول. فعّل ده عشان تتمسح لوحدها بعد 30 يوم.")) ];
     }
@@ -3338,6 +3726,57 @@ static UIViewController *MakeSettingsRoot(void) {
     [self placeCapsule:anim];
 }
 @end
+#pragma mark - Mini player bar (shown above the tab bar while a minimized player keeps playing)
+static GlassView *gMiniBar; static UIButton *gMiniPlay; static UIImageView *gMiniIc;
+static void MiniRefresh(void) {
+    if (!gMiniBar || !gActivePlayer) return;
+    BOOL playing = gActivePlayer.player.timeControlStatus != AVPlayerTimeControlStatusPaused;
+    UIImage *cov = gActivePlayer.art.image;
+    if (cov && gMiniIc) { gMiniIc.image = cov; gMiniIc.contentMode = UIViewContentModeScaleAspectFill; gMiniIc.clipsToBounds = YES; gMiniIc.layer.cornerRadius = 8; gMiniIc.tintColor = nil; }
+    SetBtnContent(gMiniPlay, Sym(playing ? @"pause.fill" : @"play.fill", 19, UIFontWeightBold), nil, UIColor.whiteColor, 16, 21);
+}
+static FlowTabs *MiniHost(void);
+static void MiniInset(CGFloat b) {
+    FlowTabs *h = MiniHost(); if (!h) return;
+    for (UIViewController *vc in h.viewControllers) { UIEdgeInsets i = vc.additionalSafeAreaInsets; if (i.bottom != b) { i.bottom = b; vc.additionalSafeAreaInsets = i; } }
+}
+static void MiniHide(void) { [gMiniBar removeFromSuperview]; gMiniBar = nil; gMiniPlay = nil; gMiniIc = nil; MiniInset(0); }
+static FlowTabs *MiniHost(void) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows) if ([w.rootViewController isKindOfClass:FlowTabs.class]) return (FlowTabs *)w.rootViewController;
+    return nil;
+}
+static void MiniShow(PlayerVC *p) {
+    FlowTabs *ft = MiniHost(); if (!ft || !p) return;
+    MiniHide();
+    GlassView *g = [GlassView new]; g.translatesAutoresizingMaskIntoConstraints = NO; g.radius = 24; gMiniBar = g;
+    [ft.view addSubview:g];
+    UIButton *open = [UIButton buttonWithType:UIButtonTypeCustom]; open.translatesAutoresizingMaskIntoConstraints = NO;
+    [open addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        PlayerVC *pv = gActivePlayer; FlowTabs *h = MiniHost(); if (!pv || !h) return;
+        UIViewController *top = h; while (top.presentedViewController) top = top.presentedViewController;
+        if ([top isKindOfClass:PlayerVC.class]) return;
+        pv.modalPresentationStyle = UIModalPresentationFullScreen; [top presentViewController:pv animated:YES completion:nil];
+    }] forControlEvents:UIControlEventTouchUpInside];
+    UIImageView *ic = [[UIImageView alloc] initWithImage:Sym(p.audio ? @"music.note" : @"film", 18, UIFontWeightSemibold)]; ic.tintColor = Theme.accent; ic.contentMode = UIViewContentModeCenter; ic.translatesAutoresizingMaskIntoConstraints = NO; ic.userInteractionEnabled = NO; gMiniIc = ic;
+    UILabel *t = Label(CleanTitle(p.path.lastPathComponent.stringByDeletingPathExtension), 14, UIFontWeightBold, UIColor.whiteColor); t.lineBreakMode = NSLineBreakByTruncatingTail; t.userInteractionEnabled = NO;
+    UIButton *pl = [UIButton buttonWithType:UIButtonTypeCustom]; pl.translatesAutoresizingMaskIntoConstraints = NO; gMiniPlay = pl;
+    [pl addAction:[UIAction actionWithHandler:^(UIAction *a) { [gActivePlayer togglePlay]; MiniRefresh(); }] forControlEvents:UIControlEventTouchUpInside];
+    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom]; x.translatesAutoresizingMaskIntoConstraints = NO;
+    SetBtnContent(x, Sym(@"xmark", 15, UIFontWeightBold), nil, [UIColor colorWithWhite:1 alpha:0.75], 16, 17);
+    [x addAction:[UIAction actionWithHandler:^(UIAction *a) { [gActivePlayer fullStop]; }] forControlEvents:UIControlEventTouchUpInside];
+    for (UIView *v in @[ open, ic, t, pl, x ]) [g.content addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [g.leadingAnchor constraintEqualToAnchor:ft.view.leadingAnchor constant:18], [g.trailingAnchor constraintEqualToAnchor:ft.view.trailingAnchor constant:-18],
+        [g.bottomAnchor constraintEqualToAnchor:ft.bar.topAnchor constant:-8], [g.heightAnchor constraintEqualToConstant:56],
+        [open.leadingAnchor constraintEqualToAnchor:g.content.leadingAnchor], [open.trailingAnchor constraintEqualToAnchor:g.content.trailingAnchor], [open.topAnchor constraintEqualToAnchor:g.content.topAnchor], [open.bottomAnchor constraintEqualToAnchor:g.content.bottomAnchor],
+        [ic.leadingAnchor constraintEqualToAnchor:g.content.leadingAnchor constant:14], [ic.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [ic.widthAnchor constraintEqualToConstant:38], [ic.heightAnchor constraintEqualToConstant:38],
+        [x.trailingAnchor constraintEqualToAnchor:g.content.trailingAnchor constant:-6], [x.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [x.widthAnchor constraintEqualToConstant:44], [x.heightAnchor constraintEqualToConstant:44],
+        [pl.trailingAnchor constraintEqualToAnchor:x.leadingAnchor], [pl.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [pl.widthAnchor constraintEqualToConstant:44], [pl.heightAnchor constraintEqualToConstant:44],
+        [t.leadingAnchor constraintEqualToAnchor:ic.trailingAnchor constant:8], [t.trailingAnchor constraintEqualToAnchor:pl.leadingAnchor constant:-6], [t.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor] ]];
+    MiniInset(64); [ft.view layoutIfNeeded];
+    MiniRefresh();
+}
+
 
 #pragma mark - App
 
@@ -3382,6 +3821,8 @@ static UIViewController *MakeSettingsRoot(void) {
     @try { [self.aurora removeFromSuperview]; self.aurora = nil; } @catch (NSException *e) { RecordIssue([@"aurora " stringByAppendingString:e.reason ?: @""]); self.aurora = nil; }
     self.window.rootViewController = tb;
     if (self.aurora) [self.window insertSubview:self.aurora atIndex:0];
+    gMiniBar = nil; gMiniPlay = nil; gMiniIc = nil;
+    if (gActivePlayer && gActivePlayer.minimized) MiniShow(gActivePlayer);
     @try {
         tb.view.tintColor = Theme.accent; self.window.tintColor = Theme.accent;
         self.window.semanticContentAttribute = IsAr() ? UISemanticContentAttributeForceRightToLeft : UISemanticContentAttributeForceLeftToRight;
@@ -3407,6 +3848,7 @@ static UIViewController *MakeSettingsRoot(void) {
 - (void)applicationDidEnterBackground:(UIApplication *)a { Crumb(@"done"); }
 - (void)applicationWillTerminate:(UIApplication *)a { Crumb(@"done"); }
 - (void)applicationDidBecomeActive:(UIApplication *)a { if (self.cover) [self unlock]; @try { [[Engine shared] autoUpdateIfDue:NO]; } @catch (NSException *e) { } }
+- (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window { return gOrient; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
     InstallCrashCatcher();
     @try { TrashAutoPurge(); } @catch (NSException *e) { }

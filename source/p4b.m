@@ -216,6 +216,7 @@
     [super viewDidLoad];
     self.title = @"Downloads"; self.sel = [NSMutableSet set];
     self.table = MakeTable(self); [self.view addSubview:self.table];
+    AddPull(self.table, self);
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[ [self.table.topAnchor constraintEqualToAnchor:g.topAnchor], [self.table.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [self.table.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor], [self.table.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor] ]];
@@ -320,4 +321,5 @@
         [[Mgr shared] remove:j deleteFile:YES]; h(YES); }];
     return [UISwipeActionsConfiguration configurationWithActions:@[ d ]];
 }
+- (void)pullRefresh { [self.table reloadData]; [self reload]; EndPull(self.table); }
 @end

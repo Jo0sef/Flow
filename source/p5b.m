@@ -294,8 +294,8 @@ static NSArray *SettingsPageByKey(NSString *key, PageVC *p) {
     if ([key isEqualToString:@"downloads"]) return DownloadsPage(p);
     if ([key isEqualToString:@"filesettings"]) {
         NSInteger sort = [UD() integerForKey:@"sortby"]; NSMutableArray *rows = [NSMutableArray array];
-        NSArray *n = @[ L(@"Name", @"الاسم"), L(@"Date modified", @"تاريخ التعديل"), L(@"Size", @"الحجم") ], *ic = @[ @"textformat", @"calendar", @"arrow.up.arrow.down" ];
-        for (NSInteger i = 0; i < 3; i++) [rows addObject:CheckRow(ic[i], Theme.accent, n[i], i == sort, ^{ [UD() setInteger:i forKey:@"sortby"]; [wp rebuild]; })];
+        NSArray *opts = @[ @[ L(@"Date added, oldest first", @"تاريخ الإضافة، الأقدم الأول"), @3, @"calendar" ], @[ L(@"Date added, newest first", @"تاريخ الإضافة، الأحدث الأول"), @1, @"calendar" ], @[ L(@"Name, A to Z", @"الاسم، من أ إلى ي"), @0, @"textformat" ], @[ L(@"Name, Z to A", @"الاسم، من ي إلى أ"), @4, @"textformat" ], @[ L(@"Size, largest first", @"الحجم، الأكبر الأول"), @2, @"arrow.up.arrow.down" ], @[ L(@"Size, smallest first", @"الحجم، الأصغر الأول"), @5, @"arrow.up.arrow.down" ] ];
+        for (NSArray *o in opts) { NSInteger v = [o[1] integerValue]; [rows addObject:CheckRow(o[2], Theme.accent, o[0], v == sort, ^{ [UD() setInteger:v forKey:@"sortby"]; [wp rebuild]; })]; }
         return @[ Sec(L(@"Sort files by", @"ترتيب الملفات حسب"), rows), Sec(nil, @[ SwitchRow(@"folder.fill", [UIColor systemYellowColor], L(@"Folders first", @"المجلدات الأول"), @"foldersfirst", YES, nil) ]),
                  SecF(nil, @[ Row(@"trash.fill", [UIColor systemRedColor], L(@"Trash", @"سلة المحذوفات"), FmtSize(TrashSize()), @"nav", ^{ [wp.navigationController pushViewController:[TrashVC new] animated:YES]; }), SwitchRow(@"clock.arrow.circlepath", [UIColor systemOrangeColor], L(@"Empty Trash after 30 days", @"فضّي السلة بعد 30 يوم"), @"trashauto", NO, nil) ], L(@"Deleted files go to Trash first. Turn this on to remove items automatically after 30 days.", @"الملفات المحذوفة بتروح السلة الأول. فعّل ده عشان تتمسح لوحدها بعد 30 يوم.")) ];
     }
@@ -425,6 +425,57 @@ static UIViewController *MakeSettingsRoot(void) {
     [self placeCapsule:anim];
 }
 @end
+#pragma mark - Mini player bar (shown above the tab bar while a minimized player keeps playing)
+static GlassView *gMiniBar; static UIButton *gMiniPlay; static UIImageView *gMiniIc;
+static void MiniRefresh(void) {
+    if (!gMiniBar || !gActivePlayer) return;
+    BOOL playing = gActivePlayer.player.timeControlStatus != AVPlayerTimeControlStatusPaused;
+    UIImage *cov = gActivePlayer.art.image;
+    if (cov && gMiniIc) { gMiniIc.image = cov; gMiniIc.contentMode = UIViewContentModeScaleAspectFill; gMiniIc.clipsToBounds = YES; gMiniIc.layer.cornerRadius = 8; gMiniIc.tintColor = nil; }
+    SetBtnContent(gMiniPlay, Sym(playing ? @"pause.fill" : @"play.fill", 19, UIFontWeightBold), nil, UIColor.whiteColor, 16, 21);
+}
+static FlowTabs *MiniHost(void);
+static void MiniInset(CGFloat b) {
+    FlowTabs *h = MiniHost(); if (!h) return;
+    for (UIViewController *vc in h.viewControllers) { UIEdgeInsets i = vc.additionalSafeAreaInsets; if (i.bottom != b) { i.bottom = b; vc.additionalSafeAreaInsets = i; } }
+}
+static void MiniHide(void) { [gMiniBar removeFromSuperview]; gMiniBar = nil; gMiniPlay = nil; gMiniIc = nil; MiniInset(0); }
+static FlowTabs *MiniHost(void) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows) if ([w.rootViewController isKindOfClass:FlowTabs.class]) return (FlowTabs *)w.rootViewController;
+    return nil;
+}
+static void MiniShow(PlayerVC *p) {
+    FlowTabs *ft = MiniHost(); if (!ft || !p) return;
+    MiniHide();
+    GlassView *g = [GlassView new]; g.translatesAutoresizingMaskIntoConstraints = NO; g.radius = 24; gMiniBar = g;
+    [ft.view addSubview:g];
+    UIButton *open = [UIButton buttonWithType:UIButtonTypeCustom]; open.translatesAutoresizingMaskIntoConstraints = NO;
+    [open addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        PlayerVC *pv = gActivePlayer; FlowTabs *h = MiniHost(); if (!pv || !h) return;
+        UIViewController *top = h; while (top.presentedViewController) top = top.presentedViewController;
+        if ([top isKindOfClass:PlayerVC.class]) return;
+        pv.modalPresentationStyle = UIModalPresentationFullScreen; [top presentViewController:pv animated:YES completion:nil];
+    }] forControlEvents:UIControlEventTouchUpInside];
+    UIImageView *ic = [[UIImageView alloc] initWithImage:Sym(p.audio ? @"music.note" : @"film", 18, UIFontWeightSemibold)]; ic.tintColor = Theme.accent; ic.contentMode = UIViewContentModeCenter; ic.translatesAutoresizingMaskIntoConstraints = NO; ic.userInteractionEnabled = NO; gMiniIc = ic;
+    UILabel *t = Label(CleanTitle(p.path.lastPathComponent.stringByDeletingPathExtension), 14, UIFontWeightBold, UIColor.whiteColor); t.lineBreakMode = NSLineBreakByTruncatingTail; t.userInteractionEnabled = NO;
+    UIButton *pl = [UIButton buttonWithType:UIButtonTypeCustom]; pl.translatesAutoresizingMaskIntoConstraints = NO; gMiniPlay = pl;
+    [pl addAction:[UIAction actionWithHandler:^(UIAction *a) { [gActivePlayer togglePlay]; MiniRefresh(); }] forControlEvents:UIControlEventTouchUpInside];
+    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom]; x.translatesAutoresizingMaskIntoConstraints = NO;
+    SetBtnContent(x, Sym(@"xmark", 15, UIFontWeightBold), nil, [UIColor colorWithWhite:1 alpha:0.75], 16, 17);
+    [x addAction:[UIAction actionWithHandler:^(UIAction *a) { [gActivePlayer fullStop]; }] forControlEvents:UIControlEventTouchUpInside];
+    for (UIView *v in @[ open, ic, t, pl, x ]) [g.content addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [g.leadingAnchor constraintEqualToAnchor:ft.view.leadingAnchor constant:18], [g.trailingAnchor constraintEqualToAnchor:ft.view.trailingAnchor constant:-18],
+        [g.bottomAnchor constraintEqualToAnchor:ft.bar.topAnchor constant:-8], [g.heightAnchor constraintEqualToConstant:56],
+        [open.leadingAnchor constraintEqualToAnchor:g.content.leadingAnchor], [open.trailingAnchor constraintEqualToAnchor:g.content.trailingAnchor], [open.topAnchor constraintEqualToAnchor:g.content.topAnchor], [open.bottomAnchor constraintEqualToAnchor:g.content.bottomAnchor],
+        [ic.leadingAnchor constraintEqualToAnchor:g.content.leadingAnchor constant:14], [ic.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [ic.widthAnchor constraintEqualToConstant:38], [ic.heightAnchor constraintEqualToConstant:38],
+        [x.trailingAnchor constraintEqualToAnchor:g.content.trailingAnchor constant:-6], [x.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [x.widthAnchor constraintEqualToConstant:44], [x.heightAnchor constraintEqualToConstant:44],
+        [pl.trailingAnchor constraintEqualToAnchor:x.leadingAnchor], [pl.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor], [pl.widthAnchor constraintEqualToConstant:44], [pl.heightAnchor constraintEqualToConstant:44],
+        [t.leadingAnchor constraintEqualToAnchor:ic.trailingAnchor constant:8], [t.trailingAnchor constraintEqualToAnchor:pl.leadingAnchor constant:-6], [t.centerYAnchor constraintEqualToAnchor:g.content.centerYAnchor] ]];
+    MiniInset(64); [ft.view layoutIfNeeded];
+    MiniRefresh();
+}
+
 
 #pragma mark - App
 
@@ -469,6 +520,8 @@ static UIViewController *MakeSettingsRoot(void) {
     @try { [self.aurora removeFromSuperview]; self.aurora = nil; } @catch (NSException *e) { RecordIssue([@"aurora " stringByAppendingString:e.reason ?: @""]); self.aurora = nil; }
     self.window.rootViewController = tb;
     if (self.aurora) [self.window insertSubview:self.aurora atIndex:0];
+    gMiniBar = nil; gMiniPlay = nil; gMiniIc = nil;
+    if (gActivePlayer && gActivePlayer.minimized) MiniShow(gActivePlayer);
     @try {
         tb.view.tintColor = Theme.accent; self.window.tintColor = Theme.accent;
         self.window.semanticContentAttribute = IsAr() ? UISemanticContentAttributeForceRightToLeft : UISemanticContentAttributeForceLeftToRight;
@@ -494,6 +547,7 @@ static UIViewController *MakeSettingsRoot(void) {
 - (void)applicationDidEnterBackground:(UIApplication *)a { Crumb(@"done"); }
 - (void)applicationWillTerminate:(UIApplication *)a { Crumb(@"done"); }
 - (void)applicationDidBecomeActive:(UIApplication *)a { if (self.cover) [self unlock]; @try { [[Engine shared] autoUpdateIfDue:NO]; } @catch (NSException *e) { } }
+- (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window { return gOrient; }
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)o {
     InstallCrashCatcher();
     @try { TrashAutoPurge(); } @catch (NSException *e) { }

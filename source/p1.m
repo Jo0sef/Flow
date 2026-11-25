@@ -7,6 +7,7 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
+#import <MediaPlayer/MediaPlayer.h>
 #import <Photos/Photos.h>
 #import <JavaScriptCore/JavaScriptCore.h>
 #import <LocalAuthentication/LocalAuthentication.h>
@@ -14,6 +15,7 @@
 #import <Vision/Vision.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <Foundation/Foundation.h>
 #include <fcntl.h>
 #include <unistd.h>
