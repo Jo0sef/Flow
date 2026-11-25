@@ -30,9 +30,18 @@ Flow is a free media and file downloader for iPhone (iOS 15+), made for personal
 
 ## Install
 
-1. Download `Flow-v1.0.26.ipa` from the [latest release](https://github.com/Jo0sef/Flow/releases/latest).
+**iPhone (iOS 15+)**
+
+1. Download the `.ipa` from the [latest iPhone release](https://github.com/Jo0sef/Flow/releases/tag/v1.0.28).
 2. Sideload it with [3uTools](https://www.3u.com/) or a similar tool (Sideloadly, AltStore) and a free Apple ID.
 3. A free Apple ID signs the app for 7 days. After that it stops opening and you need to sign it again with the same tool. Your downloaded files stay on the device.
+4. Flow shows a notice when a newer version is out. iOS cannot install updates by itself, so the notice opens the release page.
+
+**Android**
+
+1. Download the `.apk` from the [latest Android release](https://github.com/Jo0sef/Flow/releases/tag/v1.5.6).
+2. Open it and allow "install unknown apps" if Android asks.
+3. Later updates: Settings > About > Check for app update.
 
 ## Updatable extractors
 
